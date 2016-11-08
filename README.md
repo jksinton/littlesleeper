@@ -7,3 +7,4 @@ The main difference between LittleSleeper2 and Neil's is that instead of reading
 This allows the processing and web hosting to be handled completely by the RPi or offloaded to another computer that has a python environment. I've implemented the latter.
 
 The architecure is shown below:
+![alt text](https://github.com/jksinton/littlesleeper2/blob/master/common/ls2arch.png "Architecture")
