@@ -18,3 +18,6 @@ The RPi can be the Icecast + Darkice server with a mic and Littlesleeper2 can ru
 * [tornado](http://www.tornadoweb.org/en/stable/)
 * [librosa](http://librosa.github.io/librosa/)
 * [audioread](https://github.com/beetbox/audioread) (branch/master that supports audioread.decode()) See [this issue](https://github.com/beetbox/audioread/issues/35)
+
+## Other dependencies:
+* You will also need to have FFMPEG installed to decode the audio stream.
