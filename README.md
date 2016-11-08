@@ -12,6 +12,7 @@ The architecure is shown below:
 The RPi can be the Icecast + Darkice server with a mic and Littlesleeper2 can run on any commputer with python.
 
 ## Required Python libraries:
+
 * [matplotlib](http://matplotlib.org/)
 * [numpy](http://www.numpy.org/)
 * [scipy](https://www.scipy.org/)
