@@ -52,7 +52,12 @@ try:
 except ImportError:
     import Queue as queue
 
+# the sample rate of the audio parameter recovered from the 
+# the audio stream and set in samples/seconds
 SAMPLE_RATE = 2
+
+# bit rate of the audio stream set in kbits/s
+BIT_RATE = 112
 
 # After the signal has been normalized to the range [0, 1], volumes higher than this will be
 # classified as noise.
@@ -65,13 +70,20 @@ MIN_QUIET_TIME = 30
 # seconds of noise before transition mode from "quiet" to "noise"
 MIN_NOISE_TIME = 6
 
+# local server address to send the results to the tornado web server
 RESULTS_SERVER_ADDRESS = ('localhost', 6000)
 
+# web server address and port to set tornado.httpserver.HTTPServer().listen()
+WEB_SERVER_ADDRESS = ('0.0.0.0', 8090)
+
+# Store the Websocket client objects in this array (do not change this one)
+clients = []
+
 class QueueAudioStreamReader(threading.Thread):
-    """A thread that connects to an MP3 stream and sends the  
-    stream data to a FIFO queue called stream_buffer.
+    """A thread that connects to an MP3 stream and sends the stream data
+    to a FIFO queue called queue_buffer.
     """
-    def __init__(self, url, blocksize=1024, discard=False):
+    def __init__(self, url, blocksize=1024, discard=False): 
         super(QueueAudioStreamReader, self).__init__()
         self.url = url
         self.blocksize = blocksize
@@ -81,18 +93,22 @@ class QueueAudioStreamReader(threading.Thread):
 
     def run(self):
         print "Connecting to Icecast server\n"
-        streamData = urllib2.urlopen(self.url)
-        print streamData.info()
+        stream_data = urllib2.urlopen(self.url)
+        print stream_data.info()
         # to do: parse streamData.info()
         while True:
-            data = streamData.read(self.blocksize)
+            data = stream_data.read(self.blocksize)
             time_stamp = datetime.datetime.now()
             if not data:
-                break
+                continue
             if not self.discard:
-                self.queue_buffer.put([data, time_stamp])
+                self.queue_buffer.put((data, time_stamp))
+                self.queue_buffer.task_done()
 
-def StreamBufferReader(queue_read, timeout=30.0):
+def StreamBufferReader(queue_read, timeout=30.0): # todo: implement a timeout for this queue
+    """An iterator generator that reads the stream buffer and 
+    yields the compressed audio data and the time stamp
+    """
     while True:
         if not queue_read.empty():
             data = None
@@ -100,30 +116,17 @@ def StreamBufferReader(queue_read, timeout=30.0):
             if data:
                 yield data, time_stamp
             else:
-                break
+                continue
 
 def format_time_difference(time1, time2):
+    """Return the time difference as a formated str
+    """
     time_diff = datetime.datetime.fromtimestamp(time2) - datetime.datetime.fromtimestamp(time1)
     return str(time_diff).split('.')[0]
 
-class ResultsServer(threading.Thread):
-    """A thread that processes 
-    """
-    def __init__(self, results_buffer):
-        super(ResultsServer, self).__init__()
-        self.name = 'ResultsServer'
-        self.daemon = False
-        self.results_buffer = results_buffer
-
-    def run(self):
-        listener = Listener(RESULTS_SERVER_ADDRESS)
-        while True:
-            conn = listener.accept()
-            conn.send(self.results_buffer.get())
-            conn.close()
-        
 class ProcessAudioStreamBuffer(threading.Thread):
-    """A thread that processes the MP3 stream data and puts the important info in a queue
+    """A thread that processes the MP3 stream data and 
+    puts the analyzed results in a queue to be hosted by the results server
     """
     def __init__(self, queue_read, discard=False):
         super(ProcessAudioStreamBuffer, self).__init__()
@@ -136,16 +139,16 @@ class ProcessAudioStreamBuffer(threading.Thread):
         audio_dtype = np.float32
         onehour = 60 * 60
         buffer_period = onehour*12
-        buffer_len = int(buffer_period*SAMPLE_RATE)
-        default = np.float32(0)
-        pos = 0
-        counter = 0
+        buffer_len = int(buffer_period*SAMPLE_RATE) # window of audio data in memory data for analysis
+        default = np.float32(0.0) # default value if there is a decode failure
+        pos = 0 # position within the buffer
+        counter = 0 # counter for determining when to queue the results or do other repeated tasks
     
-        # create data buffers
+        # create data buffers for the audio and time stamps:
+        # (1) set all the audio buffer elements zero
+        # (2) set all time stamp elements to now
         time_stamps = np.empty(buffer_len, dtype=datetime.datetime)
         audio_buffer = np.zeros(buffer_len, dtype=audio_dtype)
-    
-        # set all time stamps to now
         time_stamps[:] = datetime.datetime.fromtimestamp(time.time())
         
         print "Processing MP3 queue buffer\n"
@@ -155,7 +158,10 @@ class ProcessAudioStreamBuffer(threading.Thread):
                 signaldata = audioread.decode(StringIO(mp3data))
             except (audioread.NoBackendError, audioread.ffdec.ReadTimeoutError):
                 print "Decode error. Setting default value"
-
+            
+            # convert the integer buffer to an array of np.float32 elementa
+            # this portion is an excerpt from librosa.core.load()
+            # https://github.com/librosa/librosa/blob/master/librosa/core/audio.py
             if signaldata is not None:
                 signal = []
                 for frame in signaldata:
@@ -170,9 +176,10 @@ class ProcessAudioStreamBuffer(threading.Thread):
                 signal = np.ascontiguousarray(signal, dtype=audio_dtype)
                 
                 peak =  np.abs(signal).max()
+            # there was a decode failure, so set the peak value to 0.0
             else:
                 peak = default
-
+            # load the latest audio parameter and its time stamp in to the buffers
             time_stamps[pos] = timestamp
             audio_buffer[pos] = peak
             pos = (pos + 1) % buffer_len
@@ -216,7 +223,6 @@ class ProcessAudioStreamBuffer(threading.Thread):
                     if start == 0:
                         continue
                     interval_length = time.mktime(rolled_time_stamps[stop-1].timetuple()) -  time.mktime(rolled_time_stamps[start].timetuple())
-                    #if interval_length < parameters['min_quiet_time']:
                     if interval_length < MIN_QUIET_TIME:
                         noise[start:stop] = True
 
@@ -229,7 +235,6 @@ class ProcessAudioStreamBuffer(threading.Thread):
                     duration = stop - start
 
                     # ignore isolated noises (i.e. with a duration less than min_noise_time)
-                    #if duration < parameters['min_noise_time']:
                     if duration < MIN_NOISE_TIME:
                         continue
 
@@ -255,19 +260,21 @@ class ProcessAudioStreamBuffer(threading.Thread):
                     time_quiet = str_quiet + format_time_difference(crying_blocks[-1]['stop'], time_current)
             
             timestamp_str = timestamp.strftime("%H:%M:%S.%f")
-            print peak, "\t", timestamp_str
              
             # generate a plot every 30 seconds and write the current state to the log file
             if counter is (SAMPLE_RATE*30)-1:
+                print peak, "\t", timestamp_str
                 # get the last hour of data for the plot (not implemented and re-sample to 1 value per second)
-                hour_chunks = int(onehour * SAMPLE_RATE)
                 hour_chunk = rolled_audio_buffer[-hour_chunks:]
                 hour_timestamps = rolled_time_stamps[-hour_chunks:]
                 
-                print "\nGenerating plot\n"
+                #print "\nGenerating plot\n"
+                # convert the time stamps to matplotlib format
                 time_stamps_plt = matplotlib.dates.date2num(hour_timestamps)
+
+                # generate plot of the past hour
                 plt.figure()
-                plt.plot_date(time_stamps_plt, hour_chunk, xdate=True, label='noise',
+                plt.plot_date(time_stamps_plt, hour_chunk, xdate=True, label='peak volumes',
                         linestyle='solid', marker=None)
                 plt.gcf().autofmt_xdate()
                 plt.legend(loc='best')
@@ -283,8 +290,9 @@ class ProcessAudioStreamBuffer(threading.Thread):
                         f.write(crying_block['start_str'] +'\t'+ crying_block['duration']+'\n')
                 f.close()
             
-            # every second load the results data in a queue
+            # every second load the results in a queue that is read by ResultsServer
             if not self.discard:
+                #print peak, "\t", timestamp_str
                 if counter % (SAMPLE_RATE*1) is (SAMPLE_RATE*1)-1:
                     results = { 'audio_plot': audio_plot,
                                 'crying_blocks': crying_blocks,
@@ -292,16 +300,32 @@ class ProcessAudioStreamBuffer(threading.Thread):
                                 'time_quiet': time_quiet }
                     self.results_buffer.put(results)
                     self.results_buffer.task_done()
-                
+                    
+            # incremenent counter 
             counter = (counter + 1) % (SAMPLE_RATE * 30)
 
-WEB_SERVER_ADDRESS = ('0.0.0.0', 8090)
+class ResultsServer(threading.Thread):
+    """A thread that hosts the results calculated by ProcessAudioStreamBuffer and sends the results
+    to the tornado web server to post to the WebSocket client(s)
+    """
+    def __init__(self, results_buffer):
+        super(ResultsServer, self).__init__()
+        self.daemon = False
+        self.results_buffer = results_buffer
+
+    def run(self):
+        listener = Listener(RESULTS_SERVER_ADDRESS)
+        while True:
+            conn = listener.accept()
+            #print self.results_buffer.qsize()
+            conn.send(self.results_buffer.get())
+            conn.close()
+
+# Web server classes:
 
 class IndexHandler(tornado.web.RequestHandler):
     def get(self):
         self.render('www/index.html')
-
-clients = []
 
 class WebSocketHandler(tornado.websocket.WebSocketHandler):
     def open(self):
@@ -315,17 +339,20 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         clients.remove(self)
 
 def broadcast_results():
-        conn = Client(RESULTS_SERVER_ADDRESS)
-        results = conn.recv()
-        conn.close()
-        # send results to all clients
-        now = datetime.datetime.now()
-        results['date_current'] = '{dt:%A} {dt:%B} {dt.day}, {dt.year}'.format(dt=now)
-        results['time_current'] = now.strftime("%I:%M:%S %p").lstrip('0')
-        results['audio_plot'] = results['audio_plot'].tolist()
-        for c in clients:
-            print "\nSending results to WebSocket Client\n"
-            c.write_message(results)
+    """Every second get the results from the ResultsServer as defined by the scheduler and
+    try to send the results to the Websocket client(s)
+    """
+    conn = Client(RESULTS_SERVER_ADDRESS)
+    results = conn.recv()
+    conn.close()
+    # send results to all clients
+    now = datetime.datetime.now()
+    results['date_current'] = '{dt:%A} {dt:%B} {dt.day}, {dt.year}'.format(dt=now)
+    results['time_current'] = now.strftime("%I:%M:%S %p").lstrip('0')
+    results['audio_plot'] = results['audio_plot'].tolist()
+    for c in clients:
+        #print "\nSending results to WebSocket Client\n"
+        c.write_message(results)
 
 def start_webserver():
     settings = {
@@ -347,23 +374,26 @@ def start_webserver():
     main_loop.start()    
 
 def main():
-    byterate = int(128*1024/float(8))
-    sampleperiod = 0.5
-    blocksize = int(byterate*sampleperiod)
+    # bit rate in kb * kilo / one byte
+    byte_rate = int(BIT_RATE*1024/float(8))
+    sample_period = 1.0/SAMPLE_RATE
+    blocksize = int(byte_rate*sample_period)
     url = "http://10.0.1.203:8000/raspi"
     
     # start thread to read MP3 data from Icecast server and 
-    # put the data in a queue
+    # put the data in queue_buffer
     mp3stream = QueueAudioStreamReader(url, blocksize=blocksize)
     mp3stream.start()
     
     # read the MP3 data in the queue, decode it, put it in the audio_buffer, and analyze it
-    process_queue = ProcessAudioStreamBuffer(mp3stream.queue_buffer,discard=False)
+    process_queue = ProcessAudioStreamBuffer(mp3stream.queue_buffer, discard=False)
     process_queue.start()
     
+    # host results in the results_buffer and send them to the webserver 
     results_server = ResultsServer(process_queue.results_buffer)
     results_server.start()
-
+    
+    # start tornado web server and web socket
     start_webserver()
 
 if __name__ == "__main__":
