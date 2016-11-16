@@ -41,6 +41,7 @@ import audioread
 import threading
 import datetime
 import time
+import signal
 import matplotlib # this must come before librosa
 
 matplotlib.use('Agg')
@@ -63,9 +64,6 @@ try:
 except ImportError:
     import Queue as queue
 
-
-# Store the Websocket client objects in this array (do not change this one)
-clients = []
 
 def setConf(args):
     """Set the default values or the values received from the command line
@@ -91,9 +89,6 @@ def setConf(args):
     # seconds of noise before transition mode from "quiet" to "noise"
     MIN_NOISE_TIME = 6
 
-    # local server address to send the results to the tornado web server
-    RESULTS_SERVER_ADDRESS = ('localhost', 6000)
-
     # web server address and port to set tornado.httpserver.HTTPServer().listen()
     WEB_SERVER_ADDRESS = ('0.0.0.0', 8090)
     
@@ -104,8 +99,6 @@ def setConf(args):
         BIT_RATE = int(args.bit_rate)
     if args.web_port:
         WEB_SERVER_ADDRESS[1] = args.web_port
-    if args.results_port:
-        RESULTS_SERVER_ADDRESS[1] = args.results_port
     if args.noise_threshold:
         NOISE_THRESHOLD = float(args.noise_threshold)
     # set debug flag
@@ -116,13 +109,13 @@ def setConf(args):
                     "NOISE_THRESHOLD":NOISE_THRESHOLD,
                     "MIN_QUIET_TIME":MIN_QUIET_TIME,
                     "MIN_NOISE_TIME":MIN_NOISE_TIME,
-                    "RESULTS_SERVER_ADDRESS":RESULTS_SERVER_ADDRESS,
                     "WEB_SERVER_ADDRESS":WEB_SERVER_ADDRESS,
                  }
 
     return configDict
 
-def getArgs():
+
+def GetCommandLineArgs():
     """Define command line arguments using argparse
     Return the arguments to main
     """
@@ -131,13 +124,13 @@ def getArgs():
     parser.add_argument('-u','--stream-url',help='URL to the MP3 stream')
     parser.add_argument('-b','--bit-rate',help='bitrate of MP3 stream')
     parser.add_argument('-p','--web-port',help='port for the web server')
-    parser.add_argument('-r','--results-port',help='port for the results server')
     parser.add_argument('-n','--noise-threshold',help='volume threshold, anything above is considered noise, anything below is considered silence')
     parser.add_argument('-v','--version',action='version', version='%(prog)s %(version)s' % {"prog": parser.prog, "version": version})
     parser.add_argument('-d','--debug',help='print debug messages',action="store_true")
 
     return parser.parse_args()
-    
+   
+
 class QueueAudioStreamReader(threading.Thread):
     """A thread that connects to an MP3 stream and sends the stream data
     to a FIFO queue called queue_buffer.
@@ -149,6 +142,7 @@ class QueueAudioStreamReader(threading.Thread):
         self.daemon = False
         self.discard = discard
         self.queue_buffer = None if discard else queue.Queue()
+        self.StopThread = False
 
     def run(self):
         print "Connecting to Icecast server\n"
@@ -163,6 +157,13 @@ class QueueAudioStreamReader(threading.Thread):
             if not self.discard:
                 self.queue_buffer.put((data, time_stamp))
                 self.queue_buffer.task_done()
+            if self.StopThread:
+                break
+        stream_data.close()
+    
+    def stop(self):
+        self.StopThread = True
+
 
 def StreamBufferReader(queue_read, timeout=30.0): # todo: implement a timeout for this queue
     """An iterator generator that reads the stream buffer and 
@@ -177,11 +178,13 @@ def StreamBufferReader(queue_read, timeout=30.0): # todo: implement a timeout fo
             else:
                 continue
 
+
 def format_time_difference(time1, time2):
     """Return the time difference as a formatted str
     """
     time_diff = datetime.datetime.fromtimestamp(time2) - datetime.datetime.fromtimestamp(time1)
     return str(time_diff).split('.')[0]
+
 
 class ProcessAudioStreamBuffer(threading.Thread):
     """A thread that processes the MP3 stream data and 
@@ -197,6 +200,7 @@ class ProcessAudioStreamBuffer(threading.Thread):
         self.min_quiet_time = min_quiet_time
         self.min_noise_time = min_noise_time
         self.results_buffer = None if discard else queue.Queue()
+        self.StopThread = False
 
     def run(self):
         audio_dtype = np.float32
@@ -371,32 +375,35 @@ class ProcessAudioStreamBuffer(threading.Thread):
                     
             # incremenent counter 
             counter = (counter + 1) % (self.sample_rate * 30)
+            
+            if self.StopThread:
+                break
+        # cleanup here
+        #
+    
+    def stop(self):
+        self.StopThread = True
 
-class ResultsServer(threading.Thread):
-    """A thread that hosts the results calculated by ProcessAudioStreamBuffer and 
-    sends the results to the tornado WebSocket handler
-    """
-    def __init__(self, results_buffer, results_server_address):
-        super(ResultsServer, self).__init__()
-        self.daemon = False
-        self.results_server_address = results_server_address
-        self.results_buffer = results_buffer
 
-    def run(self):
-        listener = Listener(self.results_server_address)
-        while True:
-            conn = listener.accept()
-            #print self.results_buffer.qsize()
-            conn.send(self.results_buffer.get())
-            conn.close()
+StopTornado = False
+
+def SignalHandler(signum, frame, stream_thread=None, process_thread=None):
+    global StopTornado
+    StopTornado = True
+    stream_thread.stop()
+    process_thread.stop()
+
 
 # Web server classes:
+
+clients = []
 
 class IndexHandler(tornado.web.RequestHandler):
     def get(self):
         self.render('www/index.html')
 
-class WebSocketHandler(tornado.websocket.WebSocketHandler):
+
+class ResultsWebSocketHandler(tornado.websocket.WebSocketHandler):
     def open(self):
         print "New connection"
         global clients
@@ -407,13 +414,12 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         global clients
         clients.remove(self)
 
-def broadcast_results(results_server_address):
+
+def BroadcastResults(results_buffer):
     """Every second get the results from the ResultsServer as defined by the scheduler and
     try to send the results to the Websocket client(s)
     """
-    conn = Client(results_server_address)
-    results = conn.recv()
-    conn.close()
+    results = results_buffer.get()
     # send results to all clients
     now = datetime.datetime.now()
     results['date_current'] = '{dt:%A} {dt:%B} {dt.day}, {dt.year}'.format(dt=now)
@@ -423,36 +429,24 @@ def broadcast_results(results_server_address):
         #print "\nSending results to WebSocket Client\n"
         c.write_message(results)
 
-def start_webserver(web_server_address, results_server_address):
-    settings = {
-        "static_path": os.path.join(os.path.dirname(__file__), "www/static"),
-    }
-    app = tornado.web.Application(
-        handlers=[
-            (r"/", IndexHandler),
-            (r"/ws", WebSocketHandler),
-        ], **settings
-    )
-    http_server = tornado.httpserver.HTTPServer(app)
-    http_server.listen(web_server_address[1], web_server_address[0])
-    print "\nListening on port:", web_server_address[1], '\n'
- 
-    main_loop = tornado.ioloop.IOLoop.instance()
-    scheduler = tornado.ioloop.PeriodicCallback(lambda: broadcast_results(results_server_address), 1000, io_loop=main_loop)
-    scheduler.start()
-    main_loop.start()    
+
+def TryExit():
+    global StopTornado
+    if StopTornado:
+        # clean up here
+        tornado.ioloop.IOLoop.instance().stop()
 
 def main():
-    args = getArgs()
+    args = GetCommandLineArgs()
     configDict = setConf(args)
-
+    
+    # set config values
     bit_rate = configDict['BIT_RATE']
     sample_rate = configDict['SAMPLE_RATE']
     stream_url = configDict['STREAM_URL']
     noise_threshold = configDict['NOISE_THRESHOLD']
     min_quiet_time = configDict['MIN_QUIET_TIME']
     min_noise_time = configDict['MIN_NOISE_TIME']
-    results_server_address = configDict['RESULTS_SERVER_ADDRESS']
     web_server_address = configDict['WEB_SERVER_ADDRESS']
 
     # bit rate in kb * kilo / one byte
@@ -474,13 +468,31 @@ def main():
     process_queue = ProcessAudioStreamBuffer(mp3stream.queue_buffer, sample_rate, 
             noise_threshold, min_quiet_time, min_noise_time, discard=False)
     process_queue.start()
+
+    # Start tornado web server and web socket hanlder
+    settings = {
+        "static_path": os.path.join(os.path.dirname(__file__), "www/static"),
+    }
+    app = tornado.web.Application(
+        handlers=[
+            tornado.web.url(r"/", IndexHandler),
+            tornado.web.url(r"/ws", ResultsWebSocketHandler, name="ws"),
+        ], **settings
+    )
+    http_server = tornado.httpserver.HTTPServer(app)
+    http_server.listen(web_server_address[1], web_server_address[0])
+    print "\nListening on port:", web_server_address[1], '\n'
+ 
+    main_loop = tornado.ioloop.IOLoop.instance()
+    scheduler = tornado.ioloop.PeriodicCallback(lambda: BroadcastResults(process_queue.results_buffer), 1000, io_loop=main_loop)
+    try_exit = tornado.ioloop.PeriodicCallback(TryExit, 100, io_loop=main_loop)
     
-    # host results in the results_buffer and send them to the webserver for hanlding web sockets
-    results_server = ResultsServer(process_queue.results_buffer, results_server_address)
-    results_server.start()
+    signal.signal(signal.SIGINT, lambda signum, frame: SignalHandler(signum, frame, stream_thread=mp3stream, process_thread=process_queue))
+    signal.signal(signal.SIGTERM, lambda signum, frame: SignalHandler(signum, frame, stream_thread=mp3stream, process_thread=process_queue))
     
-    # start tornado web server and web socket hanlder
-    start_webserver(web_server_address, results_server_address)
+    scheduler.start()
+    try_exit.start()
+    main_loop.start()    
 
 if __name__ == "__main__":
     main()
