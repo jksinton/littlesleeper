@@ -23,13 +23,15 @@
         <div class="jumbotron">
             <h1 class="time_stamp" id="quiet"><span id="time_quiet"></span></h1>
             <h1 class="time_stamp" id="crying"><span id="time_crying"></span></h1>
+			<h3><span id="current_volume"></span></h3>
+			<h3><span id="avg_volume"></span></h3>
         </div>
-
+		
         <!-- scrolling volume plot -->
         <div class="plot-container">
 			<div id="plot" class="plot-placeholder"></div>
 		</div>
-
+		
         <!-- history -->
         <table class="table table-hover" id="history_table">
         </table>
@@ -53,7 +55,7 @@
             yaxis: {
                 min: 0.0,
                 max: 1.0,
-                show: false
+                //show: false
             },
             xaxis: {
                 show: false
@@ -63,7 +65,8 @@
             }
         });
 
-        var socket = new WebSocket("ws://orange-wedge:8090/ws");
+        var socket = new WebSocket("ws://10.0.1.201:8090/ws");
+        //var socket = new WebSocket("ws://orange-wedge:8090/ws");
 
         socket.onmessage = function (message) {
             // update the text display
@@ -83,6 +86,15 @@
 			for (var i = 0; i < data.length; i++) { vals.push([i, data[i]]); }
             plot.setData([ vals ]);
             plot.draw();
+
+			// update avg volume
+			var sum = data.reduce(function(a, b) { return a + b; });
+			var avg = (sum / data.length) * 100;
+			$("#avg_volume").html("Average Noise Level: " + avg.toFixed(2) + "%");
+			
+			// update current volume
+			cur = data[data.length - 1] * 100;
+			$("#current_volume").html("Current Noise Level: " + cur.toFixed(2) + "%");
         };
     });
     </script>

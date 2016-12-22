@@ -18,30 +18,38 @@
 #
 #************************************************************************************
 #   CHANGE LOG
-#   2016-11-01  Initial creation and design framework                     - 0.1.0
+#   2016-11-01  Initial port of littlesleeper                             - 0.1.0
 #   2016-11-02  Read MP3 stream with a thread and queue the data          - 0.1.1
 #   2016-11-07  Process stream buffer with a thread                       - 0.1.2
 #   2016-11-09  Host results on webserver                                 - 0.1.3
 #   2016-11-12  Add command line arguments                                - 0.1.4
+#   2016-11-15  Gracefully close threads and main process                 - 0.1.5
+#               when SIGINT or SIGTERM signals are recieved
+#   2016-11-30  Write hourly graphs for the entire buffer                 - 0.1.6
+#   2016-12-22  config.py, password protected Icecast listener            - 0.1.7
 #
 #   TO-DOS:
 #   (1) Store buffer in sqlite database
 #   (2) Write hourly graphs for the entire buffer
-#   (3) Analyze based on average or a derivative
+#   (3) Analyze based on running average or a derivative
 #   (4) Store mp3 audio if the threshold is reached
 #   (5) Host html on apache/drupal and host websocket traffic in python/tornado
-#   (6) Natively support python 3
+#   (6) Support python 2 and 3
+#   (7) Error check command line arguments
+#   (8) Fix 7-day buffer of crying block data
 #
 #************************************************************************************
 
 import os
 import argparse
 import urllib2
+import base64
 import audioread
 import threading
 import datetime
 import time
 import signal
+import sqlite3
 import matplotlib # this must come before librosa
 
 matplotlib.use('Agg')
@@ -49,7 +57,6 @@ matplotlib.use('Agg')
 import librosa
 import matplotlib.pyplot as plt
 import numpy as np
-from multiprocessing.connection import Listener, Client
 from scipy import ndimage, interpolate
 from cStringIO import StringIO
 
@@ -64,62 +71,20 @@ try:
 except ImportError:
     import Queue as queue
 
+import config # change example.config.py to config.py
 
-def setConf(args):
-    """Set the default values or the values received from the command line
-    """
-    # the sample rate of the audio parameter recovered from the 
-    # the audio stream and set in samples/seconds
-    SAMPLE_RATE = 2
+def SetupSqlDatabase(sql_db_file):
+    db_conn = sqlite3.connect(sql_db_file)
 
-    # url to MP3 stream
-    STREAM_URL = "http://10.0.1.203:8000/raspi"
-
-    # bit rate of the audio stream set in kbits/s
-    BIT_RATE = 112
-
-    # After the signal has been normalized to the range [0, 1], volumes higher than this will be
-    # classified as noise.
-    # Change this based on: background noise, how loud the baby is, etc.
-    NOISE_THRESHOLD = 0.25
-
-    # seconds of quiet before transition mode from "noise" to "quiet"
-    MIN_QUIET_TIME = 30
-
-    # seconds of noise before transition mode from "quiet" to "noise"
-    MIN_NOISE_TIME = 6
-
-    # web server address and port to set tornado.httpserver.HTTPServer().listen()
-    WEB_SERVER_ADDRESS = ('0.0.0.0', 8090)
-    
-    # check the command line arguments for errors
-    if args.stream_url:
-        STREAM_URL = args.stream_url
-    if args.bit_rate:
-        BIT_RATE = int(args.bit_rate)
-    if args.web_port:
-        WEB_SERVER_ADDRESS[1] = args.web_port
-    if args.noise_threshold:
-        NOISE_THRESHOLD = float(args.noise_threshold)
-    # set debug flag
-    
-    configDict = {  "SAMPLE_RATE":SAMPLE_RATE,
-                    "STREAM_URL":STREAM_URL,
-                    "BIT_RATE":BIT_RATE,
-                    "NOISE_THRESHOLD":NOISE_THRESHOLD,
-                    "MIN_QUIET_TIME":MIN_QUIET_TIME,
-                    "MIN_NOISE_TIME":MIN_NOISE_TIME,
-                    "WEB_SERVER_ADDRESS":WEB_SERVER_ADDRESS,
-                 }
-
-    return configDict
+    # create table(s)
+    db_conn.close()
 
 
 def GetCommandLineArgs():
     """Define command line arguments using argparse
     Return the arguments to main
     """
-    version='0.1.4'
+    version='0.1.7'
     parser = argparse.ArgumentParser(description='This monitors an MP3 stream.')
     parser.add_argument('-u','--stream-url',help='URL to the MP3 stream')
     parser.add_argument('-b','--bit-rate',help='bitrate of MP3 stream')
@@ -135,9 +100,11 @@ class QueueAudioStreamReader(threading.Thread):
     """A thread that connects to an MP3 stream and sends the stream data
     to a FIFO queue called queue_buffer.
     """
-    def __init__(self, url, blocksize=1024, discard=False): 
+    def __init__(self, url, username, password, blocksize=1024, discard=False): 
         super(QueueAudioStreamReader, self).__init__()
         self.url = url
+        self.username = username
+        self.password = password
         self.blocksize = blocksize
         self.daemon = False
         self.discard = discard
@@ -146,9 +113,13 @@ class QueueAudioStreamReader(threading.Thread):
 
     def run(self):
         print "Connecting to Icecast server\n"
-        stream_data = urllib2.urlopen(self.url)
+        request = urllib2.Request(self.url)
+        base64string = base64.b64encode('%s:%s' % (self.username, self.password))
+        request.add_header("Authorization", "Basic %s" % base64string) 
+        #stream_data = urllib2.urlopen(self.url)
+        stream_data = urllib2.urlopen(request)
         print stream_data.info()
-        # to do: parse streamData.info()
+        # todo: parse streamData.info()
         while True:
             data = stream_data.read(self.blocksize)
             time_stamp = datetime.datetime.now()
@@ -212,9 +183,16 @@ class ProcessAudioStreamBuffer(threading.Thread):
         pos = 0 # position within the buffer
         counter = 0 # counter in for-loop to determine when to queue the results or do other repeated tasks
         
+
+        # store crying blocks for a week
+        crying_blocks = []
+
         ##########################################
         # to-do: store buffers in sqlite database
         ##########################################
+        
+        sqldb = 'ls.sqlite'
+
 
         # create data buffers for the audio and time stamps:
         # (1) set all the audio buffer elements zero
@@ -227,7 +205,7 @@ class ProcessAudioStreamBuffer(threading.Thread):
         # this is essentially a while-true loop
         for mp3data, timestamp in StreamBufferReader(self.queue_read):
             signaldata = None
-            timestamp_str = timestamp.strftime("%H:%M:%S.%f")
+            timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")
             try:
                 signaldata = audioread.decode(StringIO(mp3data))
             except (audioread.NoBackendError, audioread.ffdec.ReadTimeoutError):
@@ -249,7 +227,7 @@ class ProcessAudioStreamBuffer(threading.Thread):
                 signal = np.ascontiguousarray(signal, dtype=audio_dtype)
                 
                 peak =  np.abs(signal).max()
-            # there was a decode failure, so set the peak value to 0.0
+            # there was a decode failure, so set the peak value to default value
             else:
                 peak = default
             
@@ -285,7 +263,7 @@ class ProcessAudioStreamBuffer(threading.Thread):
             silent = rolled_audio_buffer < self.noise_threshold
 
             # join "noise blocks" that are closer together than min_quiet_time
-            crying_blocks = []
+            new_crying_blocks = []
             if np.any(noise):
                 silent_labels, _ = ndimage.label(silent)
                 silent_ranges = ndimage.find_objects(silent_labels)
@@ -307,52 +285,85 @@ class ProcessAudioStreamBuffer(threading.Thread):
                     start = time.mktime(rolled_time_stamps[cry[0].start].timetuple())
                     stop = time.mktime(rolled_time_stamps[cry[0].stop-1].timetuple())
                     duration = stop - start
-
+                    
                     # ignore isolated noises (i.e. with a duration less than min_noise_time)
                     if duration < self.min_noise_time:
                         continue
 
                     # save some info about the noise block
-                    crying_blocks.append({'start': start,
-                                          'start_str': datetime.datetime.fromtimestamp(start).strftime("%I:%M:%S %p").lstrip('0'),
-                                          'stop': stop,
-                                          'duration': format_time_difference(start, stop)})
-
+                    new_crying_blocks.append({  'start': start,
+                                                'start_str': datetime.datetime.fromtimestamp(start).strftime("%Y-%m-%d  %I:%M:%S %p").lstrip('0'),
+                                                'stop': stop,
+                                                'duration': format_time_difference(start, stop) })
+            
+            
+            # update crying blocks
+            if len(new_crying_blocks) <= 1:
+                crying_blocks = new_crying_blocks
+            else:
+                duration = new_crying_blocks[-1]['start'] - crying_blocks[0]['start']
+                #print duration
+                if duration < self.min_noise_time:
+                    crying_blocks[0] = new_crying_blocks[-1]
+                else: 
+                    crying_blocks.append(new_crying_blocks[-1])
+           
+            # only keep the last 7 days worth of crying blocks
+            # this is broken, it stores duplicates
+            now = time.time()
+            new_crying_blocks = []
+            for crying_block in crying_blocks:
+                if crying_block['start'] > (now - float(3600*24*7)):
+                    new_crying_blocks.append(crying_block)
+            crying_blocks = new_crying_blocks
+            
+            # sort crying blocks so that the most recent status is at the top
+            crying_blocks = sorted(crying_blocks, key=lambda crying_block: crying_block['start'], reverse=True)
+            
             # determine how long have we been in the current state
             time_current = time.time()
             time_crying = ""
             time_quiet = ""
             str_crying = "Baby noise for "
             str_quiet = "Baby quiet for "
-            if len(crying_blocks) == 0:
+            
+            if len(new_crying_blocks) == 0:
                 time_quiet = str_quiet + format_time_difference(time.mktime(rolled_time_stamps[0].timetuple()), 
                         time_current)
             else:
-                if time_current - crying_blocks[-1]['stop'] < self.min_quiet_time:
-                    time_crying = str_crying + format_time_difference(crying_blocks[-1]['start'], time_current)
+                # update status strings 
+                if time_current - crying_blocks[0]['stop'] < self.min_quiet_time:
+                    time_crying = str_crying + format_time_difference(crying_blocks[0]['start'], time_current)
                 else:
-                    time_quiet = str_quiet + format_time_difference(crying_blocks[-1]['stop'], time_current)
+                    time_quiet = str_quiet + format_time_difference(crying_blocks[0]['stop'], time_current)
             
-            # generate a plot every 30 seconds and write the current state to the log file
+            # every 30 seconds generate plots of the buffer and write the current state to the log file
             if counter is (self.sample_rate*30)-1:
                 print timestamp_str, "\t", peak
-                # get the last hour of data for the plot (not implemented and re-sample to 1 value per second)
-                hour_chunk = rolled_audio_buffer[-hour_chunks:]
-                hour_timestamps = rolled_time_stamps[-hour_chunks:]
                 
-                #print "\nGenerating plot\n"
-                # convert the time stamps to matplotlib format
-                time_stamps_plt = matplotlib.dates.date2num(hour_timestamps)
+                # reset the rolled buffers
+                rolled_time_stamps = np.roll(time_stamps, shift=buffer_len-pos)
+                rolled_audio_buffer = np.roll(audio_buffer, shift=buffer_len-pos)
+                
+                for i in range(hours_of_buffer):
+                    # get the last hour of data for the plot 
+                    start = hour_chunks*i
+                    end = hour_chunks*(i+1)
+                    hour_chunk = rolled_audio_buffer[start:end]
+                    hour_timestamps = rolled_time_stamps[start:end]
+                
+                    # convert the time stamps to matplotlib format
+                    time_stamps_plt = matplotlib.dates.date2num(hour_timestamps)
 
-                # generate plot of the past hour
-                plt.figure()
-                plt.plot_date(time_stamps_plt, hour_chunk, xdate=True, label='peak volumes',
-                        linestyle='solid', marker=None)
-                plt.gcf().autofmt_xdate()
-                plt.legend(loc='best')
-                plt.savefig('hour_window')
-                plt.close()
-                
+                    # generate plot of the past hour
+                    plt.figure()
+                    plt.plot_date(time_stamps_plt, hour_chunk, xdate=True, label='peak volume',
+                            linestyle='solid', marker=None)
+                    plt.gcf().autofmt_xdate()
+                    plt.legend(loc='best')
+                    plt.savefig('hour_window_' + str(hours_of_buffer - i))
+                    plt.close()
+                    
                 f = open('littlesleeper.log','w')
                 f.write(time_crying + '\n')
                 f.write(time_quiet + '\n')
@@ -362,7 +373,7 @@ class ProcessAudioStreamBuffer(threading.Thread):
                         f.write(crying_block['start_str'] +'\t'+ crying_block['duration']+'\n')
                 f.close()
             
-            # every second load the results in a queue that is read by ResultsServer
+            # every second load the results in a queue that is read by BroadcastResults
             if not self.discard:
                 #print peak, "\t", timestamp_str
                 if counter % (self.sample_rate*1) is (self.sample_rate*1)-1:
@@ -388,6 +399,7 @@ class ProcessAudioStreamBuffer(threading.Thread):
 StopTornado = False
 
 def SignalHandler(signum, frame, stream_thread=None, process_thread=None):
+    print "closing"
     global StopTornado
     StopTornado = True
     stream_thread.stop()
@@ -404,6 +416,9 @@ class IndexHandler(tornado.web.RequestHandler):
 
 
 class ResultsWebSocketHandler(tornado.websocket.WebSocketHandler):
+    def check_origin(self, origin):
+        return True
+    
     def open(self):
         print "New connection"
         global clients
@@ -438,12 +453,14 @@ def TryExit():
 
 def main():
     args = GetCommandLineArgs()
-    configDict = setConf(args)
+    configDict = config.SetConf(args)
     
     # set config values
     bit_rate = configDict['BIT_RATE']
     sample_rate = configDict['SAMPLE_RATE']
     stream_url = configDict['STREAM_URL']
+    username = configDict['USERNAME']
+    password = configDict['PASSWORD']
     noise_threshold = configDict['NOISE_THRESHOLD']
     min_quiet_time = configDict['MIN_QUIET_TIME']
     min_noise_time = configDict['MIN_NOISE_TIME']
@@ -456,7 +473,7 @@ def main():
    
     # start thread to read MP3 data from Icecast server and 
     # put the data in queue_buffer
-    mp3stream = QueueAudioStreamReader(stream_url, blocksize=blocksize)
+    mp3stream = QueueAudioStreamReader(stream_url, username, password, blocksize=blocksize)
     mp3stream.start()
     
     # Process the audio stream buffer:
