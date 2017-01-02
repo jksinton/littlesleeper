@@ -167,7 +167,7 @@ def GetCommandLineArgs():
     """Define command line arguments using argparse
     Return the arguments to main
     """
-    version='0.1.7'
+    version='0.1.8'
     parser = argparse.ArgumentParser(description='This monitors an MP3 stream.')
     parser.add_argument('-u','--stream-url',help='URL to the MP3 stream')
     parser.add_argument('-b','--bit-rate',help='bitrate of MP3 stream')

@@ -6,7 +6,7 @@ This is a port of the noise monitor written by Neil Yager called [LittleSleeper]
 
 The main difference between LittleSleeper2 and Neil's is that instead of reading the audio directly from a microphone, Littlesleeper2 processes the audio data from an MP3 stream hosted by a Raspbery Pi.
 
-This allows the processing and web hosting to be handled completely by the RPi or offloaded to another computer that has a python environment. I primarily use the latter, so I canoffload the processing to another server. However, I have briefly tested Littlesleeper2 on the Raspberry Pi and it seemed to outperform my Ubuntu Server based on CPU load.
+This allows the processing and web hosting to be handled completely by the RPi or offloaded to another computer that has a python environment. I primarily use the latter, so I can offload the processing to another server. However, I have briefly tested Littlesleeper2 on the Raspberry Pi and it seemed to outperform my Ubuntu Server based on CPU load.
 
 The architecure is shown below:
 
