@@ -6,6 +6,18 @@ __pycache__/
 # C extensions
 *.so
 
+# local littlesleeper files
+hour_window*.png
+config.py
+config.ini
+config.js
+*.log
+*.sqlite
+*.db
+
+# python
+*.pyc
+
 # Distribution / packaging
 .Python
 env/
